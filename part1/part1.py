@@ -25,7 +25,7 @@ df['type'] = le.fit_transform(df['type'])
 
 
 
-train_size = 0.3
+train_size = 0.7
 train_df, test_df, train_labels, test_labels = train_test_split(
     df['text'], df['type'], test_size=train_size, random_state=42
 )
@@ -126,7 +126,7 @@ for model_name in model_names:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    epochs = 1
+    epochs = 3
     for epoch in range(epochs):
         model.train()
         total_loss = 0
