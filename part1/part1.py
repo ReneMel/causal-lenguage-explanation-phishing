@@ -13,24 +13,21 @@ from torch.optim import AdamW
 import matplotlib.pyplot as plt
 from datasets import load_dataset  
 
-
+# Cargar el dataset
 dataset = load_dataset("renemel/compiled-phishing-dataset", split="train")  
-
-
 df = dataset.to_pandas()
 
-
+# Codificar las etiquetas
 le = LabelEncoder()
 df['type'] = le.fit_transform(df['type'])
 
-
-
+# Dividir en conjunto de entrenamiento y prueba
 train_size = 0.7
 train_df, test_df, train_labels, test_labels = train_test_split(
     df['text'], df['type'], test_size=train_size, random_state=42
 )
 
-
+# Clase para el Dataset de Emails
 class EmailDataset(Dataset):
     def __init__(self, texts, labels, tokenizer, max_len=100):
         self.texts = texts
@@ -42,7 +39,9 @@ class EmailDataset(Dataset):
         return len(self.texts)
 
     def __getitem__(self, idx):
-        text = str(self.texts.iloc[idx])
+        text = str(self.texts.iloc[idx]).strip()  # Eliminar espacios en blanco
+        if not text:  # Si el texto está vacío, reemplazarlo
+            text = "[PAD]"
         label = int(self.labels.iloc[idx])
         encoding = self.tokenizer.encode_plus(
             text,
@@ -55,12 +54,16 @@ class EmailDataset(Dataset):
         return {
             'input_ids': encoding['input_ids'].flatten(),
             'attention_mask': encoding['attention_mask'].flatten(),
-            'label': torch.tensor(label, dtype=torch.long)  
+            'label': torch.tensor(label, dtype=torch.long)
         }
 
+# Función para predicción de probabilidades
 def predict_proba(texts, model, tokenizer, device):
     probabilities = []
     for text in texts:
+        text = text.strip()  # Validar texto vacío o espacios
+        if not text:
+            text = "[PAD]"
         encoding = tokenizer.encode_plus(
             text,
             add_special_tokens=True,
@@ -74,42 +77,50 @@ def predict_proba(texts, model, tokenizer, device):
 
         with torch.no_grad():
             outputs = model(input_ids, attention_mask=attention_mask)
-            probs = torch.softmax(outputs.logits, dim=-1).cpu().numpy()  
-            probabilities.append(probs[0])  
-    
+            probs = torch.softmax(outputs.logits, dim=-1).cpu().numpy()
+            probabilities.append(probs[0])
+
     return np.array(probabilities)
 
+# Función para agregar explicaciones con SHAP y LIME
 def add_explanations(df, model, tokenizer, device):
-    
     def shap_predict_wrapper(texts):
         return predict_proba(texts, model, tokenizer, device)
     
     masker = shap.maskers.Text(tokenizer)
-    explainer_shap = shap.Explainer(shap_predict_wrapper, masker=shap.maskers.Text(tokenizer))
-    
+    explainer_shap = shap.Explainer(shap_predict_wrapper, masker)
     explainer_lime = LimeTextExplainer(class_names=['Negative', 'Positive'])
-    
+
     shap_values_list = []
     lime_values_list = []
-    
+
     for index, row in tqdm(df.iterrows(), total=df.shape[0], desc="Generating SHAP and LIME explanations"):
-        text = row['text']
-        
+        text = row['text'].strip()  # Eliminar espacios
+        if not text:  # Validar texto vacío
+            text = "[PAD]"
+
+        doc_size = len(text.split())
+        if doc_size == 0:  # Evitar problemas con documentos vacíos
+            shap_values_list.append({})
+            lime_values_list.append({})
+            continue
+
         shap_values = explainer_shap([text])
-        shap_values_list.append(shap_values.values[0].tolist())  
-        
-        lime_exp = explainer_lime.explain_instance(text, 
-                                                   lambda x: predict_proba(x, model, tokenizer, device), 
-                                                   num_features=10)
+        shap_values_list.append(shap_values.values[0].tolist())
+
+        lime_exp = explainer_lime.explain_instance(
+            text,
+            lambda x: predict_proba(x, model, tokenizer, device),
+            num_features=10
+        )
         lime_values = {word: weight for word, weight in lime_exp.as_list()}
         lime_values_list.append(lime_values)
-    
+
     df['shap_values'] = shap_values_list
     df['lime_values'] = lime_values_list
-    
     return df
 
-
+# Modelo y tokenizador
 model_names = ['roberta-base']
 results = []
 
@@ -126,6 +137,7 @@ for model_name in model_names:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
+    # Entrenamiento
     epochs = 3
     for epoch in range(epochs):
         model.train()
@@ -148,9 +160,7 @@ for model_name in model_names:
             correct_predictions += (predictions == labels).sum().item()
             total_predictions += labels.size(0)
 
-        avg_train_loss = total_loss / len(train_loader)
-        train_accuracy = correct_predictions / total_predictions
-    
+    # Evaluación
     model.eval()
     false_negatives = []
     false_positives = []  
@@ -170,29 +180,16 @@ for model_name in model_names:
             for idx, (pred, label) in enumerate(zip(predictions.cpu().numpy(), labels.cpu().numpy())):
                 global_index = batch_idx * test_loader.batch_size + idx  
                 if pred == 0 and label == 1:  
-                    false_negatives.append({
-                        'text': test_df.iloc[global_index],
-                        'true_label': label,
-                        'predicted_label': pred
-                    })
+                    false_negatives.append({'text': test_df.iloc[global_index], 'true_label': label, 'predicted_label': pred})
                 elif pred == 1 and label == 0:  
-                    false_positives.append({
-                        'text': test_df.iloc[global_index],
-                        'true_label': label,
-                        'predicted_label': pred
-                    })
+                    false_positives.append({'text': test_df.iloc[global_index], 'true_label': label, 'predicted_label': pred})
                 elif pred == label:  
-                    correct_predictions.append({
-                        'text': test_df.iloc[global_index],
-                        'true_label': label,
-                        'predicted_label': pred,
-                        'reason':''
-                    })
+                    correct_predictions.append({'text': test_df.iloc[global_index], 'true_label': label, 'predicted_label': pred})
 
                 all_labels.append(label)
                 all_preds.append(pred)
 
-    
+    # Guardar resultados con explicaciones
     fn_df = pd.DataFrame(false_negatives)
     fp_df = pd.DataFrame(false_positives)
     cp_df = pd.DataFrame(correct_predictions)
@@ -206,35 +203,3 @@ for model_name in model_names:
     cp_df_with_explanations.to_parquet(f'{model_name}_correctpredictions_with_explanations.parquet', index=False)
 
     print(f"False Negatives, False Positives, and Correct Predictions saved for {model_name}")
-
-    report = classification_report(all_labels, all_preds, target_names=le.classes_, output_dict=True)
-    
-    results.append({
-        'model': model_name,
-        'accuracy': report['accuracy'],
-        'precision': report['macro avg']['precision'],
-        'recall': report['macro avg']['recall'],
-        'f1_score': report['macro avg']['f1-score'],
-        'classification_report': str(report)  
-    })
-
-    output_dir = f'./saved_model_{model_name}/'
-    model.save_pretrained(output_dir)
-    tokenizer.save_pretrained(output_dir)
-
-    fpr, tpr, _ = roc_curve(all_labels, all_preds)
-    roc_auc = auc(fpr, tpr)
-
-    plt.figure()
-    plt.plot(fpr, tpr, color='blue', lw=2, label=f'ROC curve (AUC = {roc_auc:.2f})')
-    plt.plot([0, 1], [0, 1], color='gray', linestyle='--')
-    plt.xlim([0.0, 1.0])
-    plt.ylim([0.0, 1.05])
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title(f'Receiver Operating Characteristic (ROC) Curve - {model_name}')
-    plt.legend(loc='lower right')
-    plt.savefig(f'{model_name}_roc_curve.png')
-    plt.close()
-
-print(results)
