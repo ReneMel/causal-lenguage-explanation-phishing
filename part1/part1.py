@@ -13,21 +13,21 @@ from torch.optim import AdamW
 import matplotlib.pyplot as plt
 from datasets import load_dataset  
 
-# Cargar el dataset
+# Load the dataset
 dataset = load_dataset("renemel/compiled-phishing-dataset", split="train")  
 df = dataset.to_pandas()
 
-# Codificar las etiquetas
+# Encode labels
 le = LabelEncoder()
 df['type'] = le.fit_transform(df['type'])
 
-# Dividir en conjunto de entrenamiento y prueba
+# Split into training and test sets
 train_size = 0.7
 train_df, test_df, train_labels, test_labels = train_test_split(
     df['text'], df['type'], test_size=train_size, random_state=42
 )
 
-# Clase para el Dataset de Emails
+# Email Dataset Class
 class EmailDataset(Dataset):
     def __init__(self, texts, labels, tokenizer, max_len=100):
         self.texts = texts
@@ -39,8 +39,8 @@ class EmailDataset(Dataset):
         return len(self.texts)
 
     def __getitem__(self, idx):
-        text = str(self.texts.iloc[idx]).strip()  # Eliminar espacios en blanco
-        if not text:  # Si el texto está vacío, reemplazarlo
+        text = str(self.texts.iloc[idx]).strip()  # Remove whitespace
+        if not text:  # Replace empty text
             text = "[PAD]"
         label = int(self.labels.iloc[idx])
         encoding = self.tokenizer.encode_plus(
@@ -57,11 +57,11 @@ class EmailDataset(Dataset):
             'label': torch.tensor(label, dtype=torch.long)
         }
 
-# Función para predicción de probabilidades
+# Probability Prediction Function
 def predict_proba(texts, model, tokenizer, device):
     probabilities = []
     for text in texts:
-        text = text.strip()  # Validar texto vacío o espacios
+        text = text.strip()  # Validate empty text or spaces
         if not text:
             text = "[PAD]"
         encoding = tokenizer.encode_plus(
@@ -82,7 +82,7 @@ def predict_proba(texts, model, tokenizer, device):
 
     return np.array(probabilities)
 
-# Función para agregar explicaciones con SHAP y LIME
+# Explanation Addition Function
 def add_explanations(df, model, tokenizer, device):
     def shap_predict_wrapper(texts):
         return predict_proba(texts, model, tokenizer, device)
@@ -95,32 +95,40 @@ def add_explanations(df, model, tokenizer, device):
     lime_values_list = []
 
     for index, row in tqdm(df.iterrows(), total=df.shape[0], desc="Generating SHAP and LIME explanations"):
-        text = row['text'].strip()  # Eliminar espacios
-        if not text:  # Validar texto vacío
-            text = "[PAD]"
-
-        doc_size = len(text.split())
-        if doc_size == 0:  # Evitar problemas con documentos vacíos
+        text = row['text'].strip()  # Remove spaces
+        
+        # Improve handling of short texts
+        if not text or len(text.split()) <= 2:
             shap_values_list.append({})
             lime_values_list.append({})
             continue
 
-        shap_values = explainer_shap([text])
-        shap_values_list.append(shap_values.values[0].tolist())
+        try:
+            # More robust method for LIME
+            lime_exp = explainer_lime.explain_instance(
+                text,
+                lambda x: predict_proba(x, model, tokenizer, device),
+                num_features=min(10, len(text.split())),  # Adjust number of features
+                labels=(0, 1)  # Explicitly specify labels
+            )
+            lime_values = {word: weight for word, weight in lime_exp.as_list()}
+            lime_values_list.append(lime_values)
 
-        lime_exp = explainer_lime.explain_instance(
-            text,
-            lambda x: predict_proba(x, model, tokenizer, device),
-            num_features=10
-        )
-        lime_values = {word: weight for word, weight in lime_exp.as_list()}
-        lime_values_list.append(lime_values)
+            # SHAP
+            shap_values = explainer_shap([text])
+            shap_values_list.append(shap_values.values[0].tolist())
+
+        except Exception as e:
+            print(f"Error processing text: {text}")
+            print(f"Exception: {e}")
+            shap_values_list.append({})
+            lime_values_list.append({})
 
     df['shap_values'] = shap_values_list
     df['lime_values'] = lime_values_list
     return df
 
-# Modelo y tokenizador
+# Model and tokenizer
 model_names = ['roberta-base']
 results = []
 
@@ -137,7 +145,7 @@ for model_name in model_names:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    # Entrenamiento
+    # Training
     epochs = 3
     for epoch in range(epochs):
         model.train()
@@ -160,7 +168,7 @@ for model_name in model_names:
             correct_predictions += (predictions == labels).sum().item()
             total_predictions += labels.size(0)
 
-    # Evaluación
+    # Evaluation
     model.eval()
     false_negatives = []
     false_positives = []  
@@ -189,7 +197,7 @@ for model_name in model_names:
                 all_labels.append(label)
                 all_preds.append(pred)
 
-    # Guardar resultados con explicaciones
+    # Save results with explanations
     fn_df = pd.DataFrame(false_negatives)
     fp_df = pd.DataFrame(false_positives)
     cp_df = pd.DataFrame(correct_predictions)
