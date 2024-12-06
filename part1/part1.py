@@ -8,26 +8,33 @@ from sklearn.preprocessing import LabelEncoder
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
-from sklearn.metrics import classification_report, roc_curve, auc
+from sklearn.metrics import classification_report
 from torch.optim import AdamW
-import matplotlib.pyplot as plt
-from datasets import load_dataset  
+from datasets import load_dataset
+import logging
 
-# Load the dataset
-dataset = load_dataset("renemel/compiled-phishing-dataset", split="train")  
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Configuración para control de explicaciones
+generate_explanations = True  # Cambiar a True para generar SHAP y LIME explanations
+
+# Cargar el dataset
+dataset = load_dataset("renemel/compiled-phishing-dataset", split="train")
 df = dataset.to_pandas()
 
-# Encode labels
+# Codificar las etiquetas con LabelEncoder
 le = LabelEncoder()
 df['type'] = le.fit_transform(df['type'])
 
-# Split into training and test sets
+# Dividir en conjunto de entrenamiento y prueba
 train_size = 0.7
 train_df, test_df, train_labels, test_labels = train_test_split(
     df['text'], df['type'], test_size=train_size, random_state=42
 )
 
-# Email Dataset Class
+# Clase para el Dataset de Emails
 class EmailDataset(Dataset):
     def __init__(self, texts, labels, tokenizer, max_len=100):
         self.texts = texts
@@ -39,8 +46,8 @@ class EmailDataset(Dataset):
         return len(self.texts)
 
     def __getitem__(self, idx):
-        text = str(self.texts.iloc[idx]).strip()  # Remove whitespace
-        if not text:  # Replace empty text
+        text = str(self.texts.iloc[idx]).strip()
+        if not text:  # Validar texto vacío
             text = "[PAD]"
         label = int(self.labels.iloc[idx])
         encoding = self.tokenizer.encode_plus(
@@ -57,11 +64,11 @@ class EmailDataset(Dataset):
             'label': torch.tensor(label, dtype=torch.long)
         }
 
-# Probability Prediction Function
+# Función para predicción de probabilidades
 def predict_proba(texts, model, tokenizer, device):
     probabilities = []
     for text in texts:
-        text = text.strip()  # Validate empty text or spaces
+        text = text.strip()
         if not text:
             text = "[PAD]"
         encoding = tokenizer.encode_plus(
@@ -82,55 +89,57 @@ def predict_proba(texts, model, tokenizer, device):
 
     return np.array(probabilities)
 
-# Explanation Addition Function
+# Función para agregar explicaciones con SHAP y LIME con manejo de errores
 def add_explanations(df, model, tokenizer, device):
+    if not generate_explanations:  # Salir si no se deben generar explicaciones
+        return df
+
     def shap_predict_wrapper(texts):
         return predict_proba(texts, model, tokenizer, device)
     
-    masker = shap.maskers.Text(tokenizer)
-    explainer_shap = shap.Explainer(shap_predict_wrapper, masker)
-    explainer_lime = LimeTextExplainer(class_names=['Negative', 'Positive'])
+    try:
+        masker = shap.maskers.Text(tokenizer)
+        explainer_shap = shap.Explainer(shap_predict_wrapper, masker)
+        explainer_lime = LimeTextExplainer(class_names=['Negative', 'Positive'])
+    except Exception as e:
+        logger.error(f"Error initializing SHAP/LIME explainers: {e}")
+        return df
 
     shap_values_list = []
     lime_values_list = []
 
     for index, row in tqdm(df.iterrows(), total=df.shape[0], desc="Generating SHAP and LIME explanations"):
-        text = row['text'].strip()  # Remove spaces
-        
-        # Improve handling of short texts
-        if not text or len(text.split()) <= 2:
-            shap_values_list.append({})
-            lime_values_list.append({})
-            continue
+        text = row['text'].strip()
+        if not text:
+            text = "[PAD]"
 
         try:
-            # More robust method for LIME
+            # SHAP Explanation
+            shap_values = explainer_shap([text])
+            shap_values_list.append(shap_values.values[0].tolist())
+        except Exception as e:
+            logger.error(f"SHAP explanation error for index {index}: {e}")
+            shap_values_list.append(None)
+
+        try:
+            # LIME Explanation
             lime_exp = explainer_lime.explain_instance(
                 text,
                 lambda x: predict_proba(x, model, tokenizer, device),
-                num_features=min(10, len(text.split())),  # Adjust number of features
-                labels=(0, 1)  # Explicitly specify labels
+                num_features=10
             )
             lime_values = {word: weight for word, weight in lime_exp.as_list()}
             lime_values_list.append(lime_values)
-
-            # SHAP
-            shap_values = explainer_shap([text])
-            shap_values_list.append(shap_values.values[0].tolist())
-
         except Exception as e:
-            print(f"Error processing text: {text}")
-            print(f"Exception: {e}")
-            shap_values_list.append({})
-            lime_values_list.append({})
+            logger.error(f"LIME explanation error for index {index}: {e}")
+            lime_values_list.append(None)
 
     df['shap_values'] = shap_values_list
     df['lime_values'] = lime_values_list
     return df
 
-# Model and tokenizer
+# Modelo y tokenizador
 model_names = ['roberta-base']
-results = []
 
 for model_name in model_names:
     print(f"Training and evaluating model: {model_name}")
@@ -141,17 +150,15 @@ for model_name in model_names:
     test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False)
     model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=len(le.classes_))
     optimizer = AdamW(model.parameters(), lr=2e-5)
-    
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    # Training
+    # Entrenamiento
     epochs = 3
     for epoch in range(epochs):
         model.train()
         total_loss = 0
-        correct_predictions = 0
-        total_predictions = 0
 
         for batch in tqdm(train_loader, desc=f'Training Epoch {epoch + 1}/{epochs}'):
             input_ids = batch['input_ids'].to(device)
@@ -164,14 +171,10 @@ for model_name in model_names:
             loss.backward()
             optimizer.step()
 
-            predictions = torch.argmax(outputs.logits, dim=1)
-            correct_predictions += (predictions == labels).sum().item()
-            total_predictions += labels.size(0)
-
-    # Evaluation
+    # Evaluación
     model.eval()
     false_negatives = []
-    false_positives = []  
+    true_negatives = []
     correct_predictions = []
     all_labels = []
     all_preds = []
@@ -184,30 +187,29 @@ for model_name in model_names:
             outputs = model(input_ids, attention_mask=attention_mask, labels=labels)
 
             predictions = torch.argmax(outputs.logits, dim=1)
-            
+
             for idx, (pred, label) in enumerate(zip(predictions.cpu().numpy(), labels.cpu().numpy())):
-                global_index = batch_idx * test_loader.batch_size + idx  
+                global_index = batch_idx * test_loader.batch_size + idx
                 if pred == 0 and label == 1:  
                     false_negatives.append({'text': test_df.iloc[global_index], 'true_label': label, 'predicted_label': pred})
-                elif pred == 1 and label == 0:  
-                    false_positives.append({'text': test_df.iloc[global_index], 'true_label': label, 'predicted_label': pred})
+                elif pred == 0 and label == 0:  
+                    true_negatives.append({'text': test_df.iloc[global_index], 'true_label': label, 'predicted_label': pred})
                 elif pred == label:  
                     correct_predictions.append({'text': test_df.iloc[global_index], 'true_label': label, 'predicted_label': pred})
 
                 all_labels.append(label)
                 all_preds.append(pred)
 
-    # Save results with explanations
-    fn_df = pd.DataFrame(false_negatives)
-    fp_df = pd.DataFrame(false_positives)
-    cp_df = pd.DataFrame(correct_predictions)
+    # Guardar resultados con explicaciones si es necesario
+    tn_fn_df = pd.DataFrame(false_negatives + true_negatives)
+    tp_tn_df = pd.DataFrame(correct_predictions + true_negatives)
 
-    fn_df_with_explanations = add_explanations(fn_df, model, tokenizer, device)
-    fp_df_with_explanations = add_explanations(fp_df, model, tokenizer, device)
-    cp_df_with_explanations = add_explanations(cp_df, model, tokenizer, device)
+    try:
+        tn_fn_df = add_explanations(tn_fn_df, model, tokenizer, device)
+        tp_tn_df = add_explanations(tp_tn_df, model, tokenizer, device)
 
-    fn_df_with_explanations.to_parquet(f'{model_name}_falsenegatives_with_explanations.parquet', index=False)
-    fp_df_with_explanations.to_parquet(f'{model_name}_falsepositives_with_explanations.parquet', index=False)
-    cp_df_with_explanations.to_parquet(f'{model_name}_correctpredictions_with_explanations.parquet', index=False)
-
-    print(f"False Negatives, False Positives, and Correct Predictions saved for {model_name}")
+        tn_fn_df.to_parquet(f'{model_name}_tn_fn.parquet', index=False)
+        tp_tn_df.to_parquet(f'{model_name}_tp_tn.parquet', index=False)
+        print(f"Parquet files saved for {model_name}.")
+    except Exception as e:
+        logger.error(f"Error saving explanation results for {model_name}: {e}")
